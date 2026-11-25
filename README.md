@@ -1,4 +1,4 @@
-# 校园网自动登录（Campus Net AutoLogin）
+# 校园网自动登录v0.1（Campus Net AutoLogin）
 
 A Windows desktop tool for automatic captive-portal login on campus / public Wi-Fi. It supports multiple accounts bound to different Wi-Fi networks, optional custom portal URLs, system tray operation, and DPAPI-encrypted credentials. The UI is in Chinese.
 
@@ -11,7 +11,7 @@ A Windows desktop tool for automatic captive-portal login on campus / public Wi-
 - **兼容现代门户**：支持“两步”隐藏表单自动提交（浏览器执行 JS 二次提交）以及 JS / meta 跳转。
 - **托盘运行**：关闭窗口到系统托盘；单实例（再次双击唤起）；可选开机自启。
 - **本地安全**：密码使用 Windows DPAPI 加密；日志与诊断文件脱敏；无服务器、无遥测。
-- **空白共享版**：`main_blank.py` 构建无任何默认账户的版本，适合分享。
+- **无预设账户**：首次启动不会创建任何账户，需要自己「＋ 新建」添加。
 
 ## 工作原理
 
@@ -26,7 +26,7 @@ A Windows desktop tool for automatic captive-portal login on campus / public Wi-
 
 ## 使用
 
-1. Windows 10/11；从 [Releases](https://github.com/junyan223/campus-net-autologin/releases) 下载共享空白版 exe，或从源码运行。
+1. Windows 10/11；从 [Releases](https://github.com/junyan223/campus-net-autologin/releases) 下载 `校园网自动登录v0.1` exe，或从源码运行。
 2. 打开程序 → 「＋ 新建」→ 填写账户名称、选择/输入 Wi-Fi、登录页（一般留空自动探测）、账号密码 → 保存设置。
 3. 连接该 Wi-Fi 后，程序会在检测间隔内自动登录。
 4. 登录页留空 = 自动探测；自动探测失败时可点「探测」抓取当前认证页，或粘贴完整登录页 URL（含参数）。
@@ -39,10 +39,10 @@ Python 3.12+（Windows）：
 ```powershell
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
-.venv\Scripts\python.exe main_blank.py
+.venv\Scripts\python.exe main.py
 ```
 
-## 构建共享空白版
+## 构建
 
 ```powershell
 .venv\Scripts\python.exe -m pip install -r requirements.txt
@@ -51,13 +51,11 @@ python -m venv .venv
 
 生成：
 
-- `dist/校园网自动登录 v0.1.exe`：共享空白版（`main_blank.py`，独立配置目录与单实例，首次打开无账户）。
-
-> 仓库发布的 exe 只有共享空白版；标准构建仅用于本地开发，不随仓库发布。
+- `dist/校园网自动登录v0.1.exe`：Windows 单文件（首次启动无预设账户）。
 
 ## 安全与隐私
 
-- 配置路径：`%APPDATA%\CampusNetAutoLogin\config.json`；共享版为 `%APPDATA%\CampusNetAutoLoginBlank\config.json`。
+- 配置路径：`%APPDATA%\CampusNetAutoLogin\config.json`。
 - **程序本体（源码 / Release exe）不包含任何账号、密码或特定校园网地址**；账号密码和自定义登录页只保存在本机配置中。
 - 密码使用 Windows DPAPI（当前用户）加密；换电脑 / 换 Windows 用户需要重新输入。
 - 日志（`app.log`）与诊断页已脱敏；请勿分享配置、日志或诊断文件。
@@ -70,15 +68,14 @@ python -m venv .venv
 - 仅 Windows。
 - 不处理图形验证码、短信验证码、扫码或强 JS 加密门户；这些网络仍需手动登录。
 - 账户切换为手动；门户改版可能导致自动登录失效，日志会记录原因。
-- 共享版默认没有账户，首次打开请点「＋ 新建」。
+- 首次启动没有预设账户，需要自己添加。
 
 ## 项目结构
 
 ```text
 app/            # 配置、Wi-Fi/探测、门户解析、控制器、托盘、UI
-main.py         # 主程序入口（共用）
-main_blank.py   # 共享空白版入口
-build.py        # PyInstaller 构建脚本（共享空白版）
+main.py         # 主程序入口
+build.py        # PyInstaller 构建脚本
 assets/app.ico  # 图标
 ```
 

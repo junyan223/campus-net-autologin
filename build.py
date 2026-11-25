@@ -1,4 +1,4 @@
-"""打包脚本：生成个人版 + 共享版（无任何默认账户）单文件程序。"""
+"""打包脚本：生成 Windows 单文件程序。"""
 
 from __future__ import annotations
 
@@ -58,12 +58,7 @@ def main() -> int:
     code = build("CampusNetAutoLogin", "main.py")
     if code != 0:
         return code
-    copy_exe("CampusNetAutoLogin", "校园网自动登录.exe")
-
-    code = build("CampusNetAutoLoginBlank", "main_blank.py")
-    if code != 0:
-        return code
-    copy_exe("CampusNetAutoLoginBlank", "校园网自动登录 v0.1.exe")
+    copy_exe("CampusNetAutoLogin", "校园网自动登录v0.1.exe")
     return 0
 
 

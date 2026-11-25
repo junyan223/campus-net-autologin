@@ -13,9 +13,7 @@ from ctypes import wintypes
 from dataclasses import dataclass, field
 from pathlib import Path
 
-CHANNEL = (os.environ.get("CAMPUSNET_CHANNEL") or "main").strip().lower()
-BLANK_CHANNEL = CHANNEL == "blank"
-APP_NAME = "CampusNetAutoLoginBlank" if BLANK_CHANNEL else "CampusNetAutoLogin"
+APP_NAME = "CampusNetAutoLogin"
 APP_DIR = Path(os.environ.get("APPDATA") or Path.home()) / APP_NAME
 CONFIG_PATH = APP_DIR / "config.json"
 
@@ -270,12 +268,12 @@ class AppConfig:
                 seen.add(profile.id)
                 cfg.profiles.append(profile)
 
-        # 共享/空白版：首次启动不创建任何默认账户；个人版保持原有迁移逻辑
-        if not cfg.profiles and not BLANK_CHANNEL:
+        # 全新安装不创建任何默认账户；仅迁移旧版单账户配置
+        if not cfg.profiles:
             legacy_ssid = str(raw.get("ssid") or "").strip()
             legacy_user = str(raw.get("username") or "")
             legacy_enc = str(raw.get("password_enc") or "")
-            if raw:
+            if legacy_ssid or legacy_user or legacy_enc:
                 cfg.profiles.append(
                     Profile(
                         id=uuid.uuid4().hex,
@@ -287,8 +285,6 @@ class AppConfig:
                     )
                 )
                 migrated = True
-            else:
-                cfg.profiles.append(Profile.create("我的账户"))
 
         active = raw.get("active_profile_id")
         if cfg.profiles and isinstance(active, str) and any(p.id == active for p in cfg.profiles):
