@@ -82,6 +82,7 @@ class TrayIcon:
             "need_setup": COLOR_CAPTIVE,
             "logging_in": COLOR_WORKING,
             "checking": COLOR_WORKING,
+            "paused": COLOR_OFFLINE,
             "failed": COLOR_ERROR,
             "network_error": COLOR_ERROR,
         }.get(state, COLOR_OFFLINE)

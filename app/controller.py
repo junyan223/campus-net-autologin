@@ -72,13 +72,21 @@ class Controller:
         self._next_login_at = 0.0
         self._wake.set()
 
-    def update(self, config: AppConfig, profile: Profile, password: str) -> None:
+    def update(
+        self,
+        config: AppConfig,
+        profile: Profile,
+        password: str,
+        *,
+        wake: bool = True,
+    ) -> None:
         self.config = config
         self.profile = profile
         self.password = password
-        self._fail_count = 0
-        self._next_login_at = 0.0
-        self._wake.set()
+        if wake:
+            self._fail_count = 0
+            self._next_login_at = 0.0
+            self._wake.set()
 
     # ------------------------------------------------------------ 内部
 
@@ -112,9 +120,23 @@ class Controller:
     def _run(self) -> None:
         log.info("后台检测已启动（账户：%s）", self.profile.name)
         self._status("init", "正在启动…", f"账户：{self.profile.name}")
+        paused_notified = False
         while not self._stop.is_set():
             manual = self._manual_pending
             self._manual_pending = False
+            if not self.config.auto_check and not manual:
+                if not paused_notified:
+                    log.info("自动检测已关闭，等待手动检测")
+                    paused_notified = True
+                self._status(
+                    "paused",
+                    "自动检测已关闭",
+                    "点击「立即检测并登录」或重新开启自动检测",
+                )
+                self._wake.wait()
+                self._wake.clear()
+                continue
+            paused_notified = False
             try:
                 self._tick(manual)
             except Exception as exc:  # noqa: BLE001

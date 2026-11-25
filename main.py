@@ -89,7 +89,23 @@ def main() -> int:
     parser.add_argument("--exit-after", type=float, default=0, help="N 秒后自动退出（调试用）")
     parser.add_argument("--selftest", action="store_true", help="运行自检后退出")
     parser.add_argument("--parse-url", default=None, help="自检时解析指定认证页")
+    parser.add_argument(
+        "--high-priority-task",
+        choices=("enable", "disable"),
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
+
+    if args.high_priority_task:
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            setup_logging(APP_DIR)
+        except OSError:
+            pass
+        from app.startup import run_high_priority_action
+
+        return run_high_priority_action(args.high_priority_task == "enable")
 
     if args.selftest:
         return run_selftest(args.parse_url)

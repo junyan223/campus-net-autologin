@@ -18,7 +18,13 @@ from .config import APP_DIR, AppConfig, Profile, is_autostart_enabled, set_autos
 from .controller import Controller
 from .icons import draw_app_icon, ensure_window_icon
 from .logging_setup import log_success
-from .network import check_connectivity, list_wifi_networks
+from .network import (
+    check_connectivity,
+    get_wifi_profile_auto_connect,
+    list_wifi_networks,
+    set_wifi_profile_auto_connect,
+)
+from .startup import apply_high_priority_change, high_priority_task_exists
 from .theme import (
     ACCENT,
     ACCENT_HOVER,
@@ -56,6 +62,97 @@ class Card(tk.Frame):
         self.inner.pack(fill="both", expand=True, padx=12, pady=8)
 
 
+class ToolTip:
+    def __init__(self, widgets, text, delay: int = 350) -> None:
+        if isinstance(widgets, (tuple, list)):
+            self.widgets = list(widgets)
+        else:
+            self.widgets = [widgets]
+        self.text = text
+        self.delay = delay
+        self._job: str | None = None
+        self._tip: tk.Toplevel | None = None
+        self._label: tk.Label | None = None
+        for widget in self.widgets:
+            widget.bind("<Enter>", self._schedule, add="+")
+            widget.bind("<Leave>", self._hide, add="+")
+            widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _current_text(self) -> str:
+        return self.text() if callable(self.text) else str(self.text)
+
+    def _schedule(self, _event=None) -> None:
+        self._cancel_job()
+        if self.widgets:
+            self._job = self.widgets[0].after(self.delay, self._show)
+
+    def _cancel_job(self) -> None:
+        if self._job is not None:
+            try:
+                self.widgets[0].after_cancel(self._job)
+            except (tk.TclError, IndexError):
+                pass
+            self._job = None
+
+    def _show(self) -> None:
+        self._job = None
+        if not self.widgets:
+            return
+        text = self._current_text()
+        if not text:
+            return
+        widget = self.widgets[0]
+        try:
+            if not widget.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        if self._tip is None:
+            self._tip = tk.Toplevel(widget)
+            self._tip.wm_overrideredirect(True)
+            try:
+                self._tip.attributes("-topmost", True)
+            except tk.TclError:
+                pass
+            self._label = tk.Label(
+                self._tip,
+                text=text,
+                justify="left",
+                bg="#252a33",
+                fg=TEXT,
+                font=(FONT, 8),
+                padx=9,
+                pady=6,
+                wraplength=250,
+                highlightbackground=BORDER,
+                highlightthickness=1,
+            )
+            self._label.pack()
+        elif self._label is not None:
+            self._label.configure(text=text)
+        self._tip.update_idletasks()
+        x = widget.winfo_pointerx() + 12
+        y = widget.winfo_pointery() + 16
+        screen_w = widget.winfo_screenwidth()
+        screen_h = widget.winfo_screenheight()
+        width = self._tip.winfo_reqwidth()
+        height = self._tip.winfo_reqheight()
+        x = max(8, min(x, screen_w - width - 8))
+        y = max(8, min(y, screen_h - height - 8))
+        self._tip.geometry(f"+{x}+{y}")
+        self._tip.deiconify()
+
+    def _hide(self, _event=None) -> None:
+        self._cancel_job()
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except tk.TclError:
+                pass
+            self._tip = None
+            self._label = None
+
+
 class MainWindow:
     def __init__(
         self,
@@ -74,9 +171,23 @@ class MainWindow:
         self._last_state = "init"
         self._current_state = "init"
         self._poll_job: str | None = None
+        self._autosave_job: str | None = None
+        self._autosave_suppressed = False
+        self._loading_profile = False
+        self._toast: tk.Frame | None = None
+        self._toast_label: tk.Label | None = None
+        self._toast_job: str | None = None
         self._probe_busy = False
         self._wifi_busy = False
+        self._wifi_auto_busy = False
+        self._wifi_auto_refresh_job: str | None = None
+        self._high_busy = False
+        self._tooltips: list[ToolTip] = []
         self.tray: TrayIcon | None = None
+        actual_high = high_priority_task_exists()
+        self._high_priority_enabled = (
+            actual_high if actual_high is not None else config.high_priority_start
+        )
 
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
@@ -95,8 +206,13 @@ class MainWindow:
         self.var_ssid = tk.StringVar(value=profile.ssid if profile else "")
         self.var_portal_url = tk.StringVar(value=profile.portal_url if profile else "")
         self.var_auto = tk.BooleanVar(value=config.auto_login)
+        self.var_auto_check = tk.BooleanVar(value=config.auto_check)
         self.var_startup = tk.BooleanVar(value=is_autostart_enabled())
+        self.var_high_start = tk.BooleanVar(value=self._high_priority_enabled)
         self.var_tray = tk.BooleanVar(value=config.minimize_to_tray)
+        self.var_auto_connect = tk.BooleanVar(
+            value=profile.auto_connect_wifi if profile else True
+        )
         self.var_show_pwd = tk.BooleanVar(value=False)
         self.var_interval = tk.StringVar(value=str(config.check_interval))
 
@@ -109,12 +225,11 @@ class MainWindow:
             )
             self.controller.start()
 
-        if self.use_tray:
-            self.tray = TrayIcon(events)
-            self.tray.start()
-            self.tray.set_auto_login(config.auto_login)
+        if self.use_tray and config.minimize_to_tray:
+            self._start_tray()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.bind("<Unmap>", self._on_window_unmap, add="+")
         self._poll_job = self.root.after(100, self._poll_events)
         self.root.update_idletasks()
         self._apply_dark_titlebar()
@@ -122,8 +237,6 @@ class MainWindow:
         self.root.after(500, self._refresh_wifi)
         if exit_after > 0:
             self.root.after(int(exit_after * 1000), self.shutdown)
-        if self.tray is not None:
-            self.root.after(2500, self._check_tray_health)
         if start_hidden and self.tray is not None:
             self.root.withdraw()
             log.info("已隐藏到系统托盘，后台自动检测中")
@@ -144,11 +257,37 @@ class MainWindow:
         else:
             self._set_account_state(True)
             self._sync_profile_combo()
+            self.status_info.configure(
+                text=f"账户 {self.profile.name} · SSID {self.profile.ssid or '—'}"
+            )
             log.info(
                 "界面已就绪，当前账户：%s，配置文件：%s",
                 self.profile.name,
                 APP_DIR / "config.json",
             )
+            self.root.after(600, self._refresh_wifi_auto_state)
+
+        self._sync_startup_controls()
+        self._sync_detection_controls()
+        self._update_bottom_hint()
+        self._attach_autosave()
+        if self.var_high_start.get():
+            if self.var_startup.get():
+                try:
+                    set_autostart(False)
+                    self.var_startup.set(False)
+                    self.config.start_with_windows = False
+                    try:
+                        self.config.save()
+                    except OSError as exc:
+                        log.warning("保存配置失败：%s", exc)
+                except OSError as exc:
+                    log.warning("关闭普通开机自启失败：%s", exc)
+        elif self.config.start_with_windows:
+            try:
+                set_autostart(True)
+            except OSError as exc:
+                log.warning("更新开机自启路径失败：%s", exc)
 
     # ------------------------------------------------------------ 外观
 
@@ -494,10 +633,34 @@ class MainWindow:
             18,
         )
         self.ssid_combo.grid(row=4, column=1, sticky="ew", pady=2, padx=(0, 8))
+        wifi_auto_box = tk.Frame(body, bg=CARD)
+        wifi_auto_box.grid(row=4, column=2, sticky="e", pady=2, padx=(0, 8))
+        self.auto_wifi_check = self._check(
+            wifi_auto_box,
+            "自动连接",
+            self.var_auto_connect,
+            command=self._on_wifi_auto_toggle,
+        )
+        self.auto_wifi_check.pack(side="left")
+        wifi_info = tk.Label(
+            wifi_auto_box,
+            text="ⓘ",
+            bg=CARD,
+            fg=HINT,
+            font=(FONT, 9),
+            cursor="hand2",
+        )
+        wifi_info.pack(side="left", padx=(3, 0))
+        self._tooltips.append(
+            ToolTip(
+                (wifi_info, self.auto_wifi_check),
+                "勾选后 Windows 会自动连接到该 WiFi；取消勾选后需要手动连接。",
+            )
+        )
         self.wifi_btn = self._small_button(
             body, "刷新", self._refresh_wifi, fg=TEXT, bg="#2b303a"
         )
-        self.wifi_btn.grid(row=4, column=2, sticky="e", pady=2)
+        self.wifi_btn.grid(row=4, column=3, sticky="e", pady=2)
 
         tk.Label(body, text="登录页", bg=CARD, fg=MUTED, font=label_font, width=8, anchor="w").grid(
             row=5, column=0, sticky="w", pady=2
@@ -516,30 +679,86 @@ class MainWindow:
             fg=HINT,
             font=(FONT, 8),
         )
-        self.account_hint.grid(row=6, column=1, columnspan=2, sticky="w", pady=(1, 0))
+        self.account_hint.grid(row=6, column=1, columnspan=3, sticky="w", pady=(1, 0))
 
         # 设置卡片
         options = Card(outer)
         options.grid(row=3, column=0, sticky="ew", pady=(0, 8))
         body = options.inner
-        body.grid_columnconfigure(4, weight=1)
         tk.Label(
             body, text="运行设置", bg=CARD, fg=TEXT, font=(FONT, 9, "bold"), anchor="w"
-        ).grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 4))
+        ).pack(anchor="w", pady=(0, 4))
+
+        options_row = tk.Frame(body, bg=CARD)
+        options_row.pack(anchor="w")
         self._check(
-            body, "自动登录", self.var_auto, command=self._on_auto_toggle
-        ).grid(row=1, column=0, sticky="w")
-        self._check(body, "开机自启", self.var_startup).grid(
-            row=1, column=1, sticky="w", padx=(14, 0)
+            options_row, "自动登录", self.var_auto, command=self._on_auto_toggle
+        ).pack(side="left")
+        self.startup_check = self._check(
+            options_row,
+            "开机自启",
+            self.var_startup,
+            command=self._on_startup_toggle,
         )
-        self._check(
-            body, "关闭窗口时最小化到托盘", self.var_tray
-        ).grid(row=1, column=2, columnspan=2, sticky="w", padx=(14, 0))
-        tk.Label(body, text="检测间隔", bg=CARD, fg=MUTED, font=(FONT, 9)).grid(
-            row=2, column=0, sticky="w", pady=(4, 0)
+        self.startup_check.pack(side="left", padx=(14, 0))
+        self._startup_tooltip = ToolTip(
+            self.startup_check, self._startup_tooltip_text
         )
-        spin = tk.Spinbox(
-            body,
+
+        high_box = tk.Frame(options_row, bg=CARD)
+        high_box.pack(side="left", padx=(14, 0))
+        high_info = tk.Label(
+            high_box,
+            text="ⓘ",
+            bg=CARD,
+            fg=HINT,
+            font=(FONT, 9),
+            cursor="hand2",
+        )
+        high_info.pack(side="left", padx=(0, 3))
+        self.high_check = self._check(
+            high_box,
+            "开机自启动（高优先级）",
+            self.var_high_start,
+            command=self._on_high_toggle,
+        )
+        self.high_check.pack(side="left")
+        self._tooltips.append(
+            ToolTip(
+                (high_info, self.high_check),
+                "开启此选项将会电脑开机的时候优先启动。\n"
+                "首次开启需要管理员授权；计划任务会在登录时以高优先级启动。",
+            )
+        )
+
+        options_row2 = tk.Frame(body, bg=CARD)
+        options_row2.pack(anchor="w", pady=(4, 0))
+        self.tray_check = self._check(
+            options_row2,
+            "关闭窗口时最小化到托盘",
+            self.var_tray,
+            command=self._on_tray_toggle,
+        )
+        self.tray_check.pack(side="left")
+        self.auto_check = self._check(
+            options_row2,
+            "自动检测",
+            self.var_auto_check,
+            command=self._on_auto_check_toggle,
+        )
+        self.auto_check.pack(side="left", padx=(18, 0))
+        self._tooltips.append(
+            ToolTip(
+                self.auto_check,
+                "关闭后不再按检测间隔自动检测；仍可点击「立即检测并登录」手动检测。",
+            )
+        )
+        self.interval_label = tk.Label(
+            options_row2, text="检测间隔", bg=CARD, fg=MUTED, font=(FONT, 9)
+        )
+        self.interval_label.pack(side="left", padx=(18, 0))
+        self.interval_spin = tk.Spinbox(
+            options_row2,
             from_=5,
             to=300,
             increment=5,
@@ -557,31 +776,20 @@ class MainWindow:
             highlightcolor=ACCENT,
             font=(FONT, 9),
         )
-        spin.grid(row=2, column=1, sticky="w", pady=(4, 0), padx=(6, 4))
-        tk.Label(body, text="秒", bg=CARD, fg=MUTED, font=(FONT, 9)).grid(
-            row=2, column=2, sticky="w", pady=(4, 0)
+        self.interval_spin.pack(side="left", padx=(6, 4))
+        self.interval_unit = tk.Label(
+            options_row2, text="秒", bg=CARD, fg=MUTED, font=(FONT, 9)
         )
-        tk.Label(
-            body,
-            text="后台按此间隔检测，发现需要认证就自动登录",
-            bg=CARD,
-            fg=HINT,
-            font=(FONT, 8),
-        ).grid(row=2, column=3, columnspan=2, sticky="w", pady=(4, 0), padx=(8, 0))
+        self.interval_unit.pack(side="left")
 
         # 按钮
         buttons = tk.Frame(outer, bg=BG)
         buttons.grid(row=4, column=0, sticky="ew", pady=(0, 8))
-        buttons.grid_columnconfigure(0, weight=3)
-        buttons.grid_columnconfigure(1, weight=2)
+        buttons.grid_columnconfigure(0, weight=1)
         self.check_button = self._button(
             buttons, "立即检测并登录", self._on_check, primary=True
         )
-        self.check_button.grid(row=0, column=0, sticky="ew", padx=(0, 8), ipady=1)
-        self.save_button = self._button(
-            buttons, "保存设置", self._on_save, primary=False
-        )
-        self.save_button.grid(row=0, column=1, sticky="ew", ipady=1)
+        self.check_button.grid(row=0, column=0, sticky="ew", ipady=1)
 
         # 日志
         log_card = Card(outer)
@@ -630,13 +838,16 @@ class MainWindow:
         self.log_text.tag_configure("ERROR", foreground=DANGER)
 
         # 底部说明
-        tk.Label(
+        self.bottom_hint = tk.Label(
             outer,
-            text="关闭窗口会隐藏到系统托盘并继续后台检测 · 双击托盘图标可重新打开",
+            text="",
             bg=BG,
             fg=HINT,
             font=(FONT, 8),
-        ).grid(row=6, column=0, sticky="w", pady=(6, 0))
+            wraplength=580,
+            justify="left",
+        )
+        self.bottom_hint.grid(row=6, column=0, sticky="w", pady=(6, 0))
 
     # ------------------------------------------------------------ 事件
 
@@ -673,6 +884,12 @@ class MainWindow:
             self._handle_portal_probe(event)
         elif kind == "wifi_list":
             self._handle_wifi_list(event)
+        elif kind == "wifi_auto_state":
+            self._handle_wifi_auto_state(event)
+        elif kind == "wifi_auto_result":
+            self._handle_wifi_auto_result(event)
+        elif kind == "high_priority":
+            self._handle_high_priority(event)
         elif kind == "action":
             self._handle_action(event.get("action", ""))
 
@@ -731,20 +948,31 @@ class MainWindow:
     # ------------------------------------------------------------ 账户操作
 
     def _load_profile(self, profile: Profile) -> None:
-        self.profile = profile
-        self.var_profile_name.set(profile.name)
-        self.var_user.set(profile.username)
-        self.var_pwd.set(profile.get_password())
-        self.var_ssid.set(profile.ssid)
-        self.var_portal_url.set(profile.portal_url)
-        self.var_show_pwd.set(False)
-        self.pwd_entry.configure(show="●")
-        self.var_profile_select.set(profile.name)
-        values = list(self.ssid_combo.cget("values"))
-        if profile.ssid and profile.ssid not in values:
-            values.append(profile.ssid)
-            self.ssid_combo.configure(values=values)
+        self._cancel_auto_save()
+        self._loading_profile = True
+        try:
+            self.profile = profile
+            self.var_profile_name.set(profile.name)
+            self.var_user.set(profile.username)
+            self.var_pwd.set(profile.get_password())
+            self.var_ssid.set(profile.ssid)
+            self.var_portal_url.set(profile.portal_url)
+            self.var_auto_connect.set(profile.auto_connect_wifi)
+            self.var_show_pwd.set(False)
+            self.pwd_entry.configure(show="●")
+            self.var_profile_select.set(profile.name)
+            values = list(self.ssid_combo.cget("values"))
+            if profile.ssid and profile.ssid not in values:
+                values.append(profile.ssid)
+                self.ssid_combo.configure(values=values)
+        finally:
+            self._loading_profile = False
+        self.status_info.configure(
+            text=f"账户 {profile.name} · SSID {profile.ssid or '—'}"
+        )
         self._set_account_state(True)
+        self._update_wifi_auto_enabled()
+        self._schedule_wifi_auto_refresh()
 
     def _sync_profile_combo(self) -> None:
         names = [p.name for p in self.config.profiles]
@@ -775,9 +1003,12 @@ class MainWindow:
             self.probe_btn,
             self.delete_btn,
             self.check_button,
-            self.save_button,
         ):
             button.configure(state=state)
+        if not enabled:
+            self.auto_wifi_check.configure(state="disabled")
+        else:
+            self._update_wifi_auto_enabled()
         self.account_hint.configure(
             text=(
                 "登录页留空则自动探测；仅在自动探测失败的网络才需填写完整地址（含参数）"
@@ -786,28 +1017,32 @@ class MainWindow:
             )
         )
 
-    def _capture_form(self) -> bool:
+    def _capture_form(self, *, quiet: bool = False) -> bool:
         if self.profile is None:
-            log.warning("请先新建账户")
+            if not quiet:
+                log.warning("请先新建账户")
             return False
         name = self.var_profile_name.get().strip()
         if not name:
-            log.warning("账户名称不能为空")
+            if not quiet:
+                log.warning("账户名称不能为空")
             return False
         if any(
             p.id != self.profile.id and p.name.casefold() == name.casefold()
             for p in self.config.profiles
         ):
-            log.warning("账户名称「%s」已存在，请换一个名称", name)
+            if not quiet:
+                log.warning("账户名称「%s」已存在，请换一个名称", name)
             return False
         portal_url = self.var_portal_url.get().strip()
         if portal_url and not portal_url.lower().startswith(("http://", "https://")):
             portal_url = "http://" + portal_url
-            self.var_portal_url.set(portal_url)
+            self._set_var_quiet(self.var_portal_url, portal_url)
         self.profile.name = name
         self.profile.ssid = self.var_ssid.get().strip()
         self.profile.username = self.var_user.get().strip()
         self.profile.portal_url = portal_url
+        self.profile.auto_connect_wifi = self.var_auto_connect.get()
         self.profile.set_password(self.var_pwd.get())
         return True
 
@@ -820,7 +1055,8 @@ class MainWindow:
         )
         if target is None or target.id == self.profile.id:
             return
-        if not self._save_settings():
+        self._cancel_auto_save()
+        if not self._save_settings(quiet=True):
             self.var_profile_select.set(self.profile.name)
             return
         self.config.active_profile_id = target.id
@@ -835,7 +1071,8 @@ class MainWindow:
         log.info("已切换到账户：%s", target.name)
 
     def _new_profile(self) -> None:
-        if self.profile is not None and not self._save_settings():
+        self._cancel_auto_save()
+        if self.profile is not None and not self._save_settings(quiet=True):
             return
         profile = self.config.add_profile("新账户")
         self.config.active_profile_id = profile.id
@@ -864,6 +1101,7 @@ class MainWindow:
             parent=self.root,
         ):
             return
+        self._cancel_auto_save()
         deleted_name = self.profile.name
         if not self.config.delete_profile(self.profile.id):
             log.warning("删除账户失败")
@@ -884,76 +1122,481 @@ class MainWindow:
     def _toggle_password_visibility(self) -> None:
         self.pwd_entry.configure(show="" if self.var_show_pwd.get() else "●")
 
+    def _set_var_quiet(self, variable: tk.Variable, value) -> None:
+        previous = self._autosave_suppressed
+        self._autosave_suppressed = True
+        try:
+            variable.set(value)
+        finally:
+            self._autosave_suppressed = previous
+
+    def _attach_autosave(self) -> None:
+        for variable in (
+            self.var_profile_name,
+            self.var_user,
+            self.var_pwd,
+            self.var_portal_url,
+            self.var_interval,
+        ):
+            variable.trace_add("write", self._schedule_auto_save)
+        self.var_ssid.trace_add("write", self._on_ssid_var_changed)
+
+    def _schedule_auto_save(self, *_args) -> None:
+        if (
+            self._closing
+            or self._autosave_suppressed
+            or self._loading_profile
+            or self.profile is None
+        ):
+            return
+        self._cancel_auto_save()
+        self._autosave_job = self.root.after(800, self._auto_save_now)
+
+    def _cancel_auto_save(self) -> None:
+        if self._autosave_job is not None:
+            try:
+                self.root.after_cancel(self._autosave_job)
+            except tk.TclError:
+                pass
+            self._autosave_job = None
+
+    def _auto_save_now(self) -> None:
+        self._autosave_job = None
+        if self._closing or self.profile is None:
+            return
+        if self._save_settings(quiet=True):
+            self._show_toast("设置已保存")
+
+    def _flush_auto_save(self) -> None:
+        had_pending = self._autosave_job is not None
+        self._cancel_auto_save()
+        if had_pending and self.profile is not None:
+            self._save_settings(quiet=True)
+
+    def _save_config(self) -> bool:
+        try:
+            self.config.save()
+            return True
+        except OSError as exc:
+            log.error("保存配置失败：%s", exc)
+            self._show_toast("保存设置失败", error=True)
+            return False
+
+    def _show_toast(self, message: str, *, error: bool = False) -> None:
+        if self._closing:
+            return
+        color = DANGER if error else SUCCESS
+        bg = "#2b1e20" if error else "#1d2b24"
+        if self._toast is None:
+            self._toast = tk.Frame(
+                self.root,
+                bg=bg,
+                highlightbackground=color,
+                highlightthickness=1,
+            )
+            self._toast_label = tk.Label(
+                self._toast,
+                bg=bg,
+                fg=color,
+                font=(FONT, 9, "bold"),
+                padx=14,
+                pady=6,
+                wraplength=320,
+                justify="center",
+            )
+            self._toast_label.pack()
+        else:
+            self._toast.configure(bg=bg, highlightbackground=color)
+            if self._toast_label is not None:
+                self._toast_label.configure(bg=bg, fg=color)
+        if self._toast_label is not None:
+            prefix = "! " if error else "✓ "
+            self._toast_label.configure(text=prefix + message)
+        self._toast.place(relx=0.5, y=8, anchor="n")
+        self._toast.lift()
+        if self._toast_job is not None:
+            try:
+                self.root.after_cancel(self._toast_job)
+            except tk.TclError:
+                pass
+        self._toast_job = self.root.after(1800, self._hide_toast)
+
+    def _hide_toast(self) -> None:
+        self._toast_job = None
+        if self._toast is not None:
+            try:
+                self._toast.place_forget()
+            except tk.TclError:
+                pass
+
     def _on_auto_toggle(self) -> None:
         enabled = self.var_auto.get()
         self.config.auto_login = enabled
-        try:
-            self.config.save()
-        except OSError as exc:
-            log.error("保存配置失败：%s", exc)
+        if not self._save_config():
+            return
         if self.controller is not None:
             self.controller.update(self.config, self.profile, self.var_pwd.get())
         if self.tray is not None:
             self.tray.set_auto_login(enabled)
         log.info("自动登录已%s", "开启" if enabled else "关闭")
+        self._show_toast("设置已保存")
 
-    def _on_save(self) -> None:
-        self._save_settings()
-
-    def _save_settings(self) -> bool:
-        if self.profile is None:
-            log.warning("请先新建账户")
-            return False
-        if not self._capture_form():
-            return False
+    def _on_startup_toggle(self) -> None:
+        if self.var_high_start.get():
+            self.var_startup.set(False)
+            return
+        enabled = self.var_startup.get()
         try:
-            interval = int(float(self.var_interval.get()))
-        except ValueError:
+            set_autostart(enabled)
+        except OSError as exc:
+            log.error("设置开机自启失败：%s", exc)
+            self.var_startup.set(is_autostart_enabled())
+            self._show_toast("开机自启设置失败", error=True)
+            return
+        self.config.start_with_windows = enabled
+        if not self._save_config():
+            return
+        log.info("开机自启已%s", "开启" if enabled else "关闭")
+        self._show_toast("设置已保存")
+
+    def _sync_startup_controls(self) -> None:
+        high = bool(self.var_high_start.get())
+        if self._high_busy:
+            self.high_check.configure(state="disabled")
+            self.startup_check.configure(state="disabled")
+        else:
+            self.high_check.configure(state="normal")
+            self.startup_check.configure(state="disabled" if high else "normal")
+        self._startup_tooltip._hide()
+
+    def _startup_tooltip_text(self) -> str:
+        if self.var_high_start.get():
+            return "请先关闭高优先级开机自启"
+        if self._high_busy:
+            return "正在处理高优先级开机自启设置，请稍候"
+        return ""
+
+    def _sync_detection_controls(self) -> None:
+        enabled = bool(self.var_auto_check.get())
+        self.interval_spin.configure(state="normal" if enabled else "disabled")
+        color = MUTED if enabled else HINT
+        self.interval_label.configure(fg=color)
+        self.interval_unit.configure(fg=color)
+
+    def _on_auto_check_toggle(self) -> None:
+        enabled = bool(self.var_auto_check.get())
+        self.config.auto_check = enabled
+        if not self._save_config():
+            return
+        self._sync_detection_controls()
+        if self.controller is not None:
+            self.controller.update(self.config, self.profile, self.var_pwd.get())
+        log.info("自动检测已%s", "开启" if enabled else "关闭")
+        self._show_toast("设置已保存")
+
+    def _on_high_toggle(self) -> None:
+        if self._high_busy:
+            return
+        enable = bool(self.var_high_start.get())
+        self._high_busy = True
+        self._sync_startup_controls()
+        log.info(
+            "正在%s高优先级开机自启…（会请求一次管理员授权）",
+            "开启" if enable else "关闭",
+        )
+
+        def worker() -> None:
+            ok, detail = apply_high_priority_change(enable)
+            self.events.put(
+                {
+                    "type": "high_priority",
+                    "enable": enable,
+                    "ok": ok,
+                    "detail": detail,
+                }
+            )
+
+        threading.Thread(target=worker, name="high-priority", daemon=True).start()
+
+    def _handle_high_priority(self, event: dict) -> None:
+        self._high_busy = False
+        enable = bool(event.get("enable"))
+        ok = bool(event.get("ok"))
+        detail = str(event.get("detail") or "")
+        actual = high_priority_task_exists()
+        if ok:
+            if enable:
+                try:
+                    set_autostart(False)
+                except OSError as exc:
+                    log.error("关闭普通开机自启失败：%s", exc)
+                self.var_startup.set(is_autostart_enabled())
+                self.config.start_with_windows = self.var_startup.get()
+                log_success("已开启高优先级开机自启动（登录时计划任务）")
+            else:
+                log.info("已关闭高优先级开机自启动")
+            self.var_high_start.set(actual if actual is not None else enable)
+            self.config.high_priority_start = self.var_high_start.get()
+            if self._save_config():
+                self._show_toast("设置已保存")
+        else:
+            self.var_high_start.set(
+                actual if actual is not None else (not enable)
+            )
+            self.config.high_priority_start = self.var_high_start.get()
+            self._save_config()
+            log.warning("高优先级开机自启未更改：%s", detail or "操作失败")
+            self._show_toast(detail or "高优先级自启未更改", error=True)
+        self._sync_startup_controls()
+
+    def _start_tray(self) -> None:
+        if not self.use_tray or self.tray is not None:
+            return
+        self.tray = TrayIcon(self.events)
+        self.tray.start()
+        self.tray.set_auto_login(self.config.auto_login)
+        try:
+            self.tray.set_status(self._current_state, self.status_title.cget("text"))
+        except tk.TclError:
+            pass
+        self.root.after(2500, self._check_tray_health)
+
+    def _update_bottom_hint(self) -> None:
+        prefix = "设置修改后自动保存"
+        if self.var_tray.get() and self.tray is not None:
+            text = (
+                f"{prefix} · 关闭窗口会隐藏到系统托盘并继续后台检测 · "
+                "双击托盘图标可重新打开"
+            )
+        else:
+            text = f"{prefix} · 关闭窗口将直接退出程序，后台自动检测停止"
+        self.bottom_hint.configure(text=text)
+
+    def _on_tray_toggle(self) -> None:
+        enabled = bool(self.var_tray.get())
+        if enabled and not self.use_tray:
+            self.var_tray.set(False)
+            self._show_toast("当前启动参数禁用了系统托盘", error=True)
+            return
+        self.config.minimize_to_tray = enabled
+        if enabled:
+            self._start_tray()
+            log.info("已开启托盘后台运行")
+        else:
+            if self.tray is not None:
+                self.tray.stop()
+                self.tray = None
+            log.info("已关闭托盘后台运行；关闭窗口将退出程序")
+        self._update_bottom_hint()
+        if self._save_config():
+            self._show_toast("设置已保存")
+
+    def _update_wifi_auto_enabled(self) -> None:
+        enabled = (
+            self.profile is not None
+            and bool(self.var_ssid.get().strip())
+            and not self._wifi_auto_busy
+        )
+        self.auto_wifi_check.configure(state="normal" if enabled else "disabled")
+
+    def _on_ssid_var_changed(self, *_args) -> None:
+        self._update_wifi_auto_enabled()
+        if self._loading_profile or self._autosave_suppressed:
+            return
+        self._schedule_auto_save()
+        self._schedule_wifi_auto_refresh()
+
+    def _schedule_wifi_auto_refresh(self) -> None:
+        if self._closing:
+            return
+        if self._wifi_auto_refresh_job is not None:
+            try:
+                self.root.after_cancel(self._wifi_auto_refresh_job)
+            except tk.TclError:
+                pass
+        self._wifi_auto_refresh_job = self.root.after(
+            650, self._refresh_wifi_auto_state
+        )
+
+    def _refresh_wifi_auto_state(self) -> None:
+        self._wifi_auto_refresh_job = None
+        if self.profile is None:
+            return
+        ssid = self.var_ssid.get().strip()
+        if not ssid:
+            return
+        profile_id = self.profile.id
+
+        def worker() -> None:
+            mode = get_wifi_profile_auto_connect(ssid)
+            self.events.put(
+                {
+                    "type": "wifi_auto_state",
+                    "profile_id": profile_id,
+                    "ssid": ssid,
+                    "mode": mode,
+                }
+            )
+
+        threading.Thread(target=worker, name="wifi-auto-state", daemon=True).start()
+
+    def _handle_wifi_auto_state(self, event: dict) -> None:
+        if self.profile is None or event.get("profile_id") != self.profile.id:
+            return
+        if event.get("ssid") != self.var_ssid.get().strip():
+            return
+        mode = event.get("mode")
+        if not isinstance(mode, bool) or self._wifi_auto_busy:
+            return
+        self.var_auto_connect.set(mode)
+        self.profile.auto_connect_wifi = mode
+
+    def _on_wifi_auto_toggle(self) -> None:
+        if self._wifi_auto_busy or self.profile is None:
+            return
+        ssid = self.var_ssid.get().strip()
+        if not ssid:
+            self._update_wifi_auto_enabled()
+            return
+        enable = bool(self.var_auto_connect.get())
+        self._wifi_auto_busy = True
+        self._update_wifi_auto_enabled()
+        log.info("正在%s WiFi「%s」的自动连接…", "开启" if enable else "关闭", ssid)
+
+        def worker() -> None:
+            ok, detail = set_wifi_profile_auto_connect(ssid, enable)
+            self.events.put(
+                {
+                    "type": "wifi_auto_result",
+                    "ssid": ssid,
+                    "enable": enable,
+                    "ok": ok,
+                    "detail": detail,
+                }
+            )
+
+        threading.Thread(target=worker, name="wifi-auto-set", daemon=True).start()
+
+    def _handle_wifi_auto_result(self, event: dict) -> None:
+        self._wifi_auto_busy = False
+        ssid = str(event.get("ssid") or "")
+        enable = bool(event.get("enable"))
+        ok = bool(event.get("ok"))
+        current_ssid = self.var_ssid.get().strip()
+        if ok:
+            if current_ssid == ssid:
+                self.var_auto_connect.set(enable)
+                if self.profile is not None:
+                    self.profile.auto_connect_wifi = enable
+            log_success("已%s WiFi「%s」的自动连接", "开启" if enable else "关闭", ssid)
+            if current_ssid == ssid:
+                if self._save_config():
+                    self._show_toast("设置已保存")
+        else:
+            detail = str(event.get("detail") or "未知错误")
+            if current_ssid == ssid:
+                self.var_auto_connect.set(not enable)
+                if self.profile is not None:
+                    self.profile.auto_connect_wifi = not enable
+                self._save_config()
+            log.warning("设置 WiFi「%s」自动连接失败：%s", ssid, detail)
+            self._show_toast("WiFi 自动连接设置失败", error=True)
+        self._update_wifi_auto_enabled()
+        self._schedule_wifi_auto_refresh()
+
+    def _save_settings(self, *, quiet: bool = False) -> bool:
+        if self.profile is None:
+            if not quiet:
+                log.warning("请先新建账户")
+            return False
+        if not self._capture_form(quiet=quiet):
+            return False
+        raw_interval = self.var_interval.get().strip()
+        try:
+            interval = int(float(raw_interval))
+        except (TypeError, ValueError):
             interval = self.config.check_interval
         interval = max(5, min(300, interval))
-        self.var_interval.set(str(interval))
+        if raw_interval != str(interval):
+            self._set_var_quiet(self.var_interval, str(interval))
 
         previous_startup = self.config.start_with_windows
+        high_enabled = bool(self.var_high_start.get())
+        want_normal_startup = bool(self.var_startup.get()) and not high_enabled
         self.config.active_profile_id = self.profile.id
         self.config.auto_login = self.var_auto.get()
+        self.config.auto_check = self.var_auto_check.get()
         self.config.check_interval = interval
         self.config.minimize_to_tray = self.var_tray.get()
-        self.config.start_with_windows = self.var_startup.get()
+        self.config.high_priority_start = high_enabled
+        self.config.start_with_windows = want_normal_startup
 
         try:
             self.config.save()
         except OSError as exc:
             log.error("保存配置失败：%s", exc)
+            if not quiet:
+                self._show_toast("保存设置失败", error=True)
             return False
 
-        if self.config.start_with_windows != previous_startup or self.config.start_with_windows:
+        if want_normal_startup != previous_startup or (
+            want_normal_startup and not quiet
+        ):
             try:
-                set_autostart(self.config.start_with_windows)
+                set_autostart(want_normal_startup)
             except OSError as exc:
                 log.error("设置开机自启失败：%s", exc)
                 self.var_startup.set(is_autostart_enabled())
                 self.config.start_with_windows = self.var_startup.get()
+                try:
+                    self.config.save()
+                except OSError:
+                    pass
+        elif high_enabled and self.var_startup.get():
+            try:
+                set_autostart(False)
+                self.var_startup.set(False)
+                self.config.start_with_windows = False
+                try:
+                    self.config.save()
+                except OSError:
+                    pass
+            except OSError as exc:
+                log.warning("关闭普通开机自启失败：%s", exc)
 
+        self._sync_startup_controls()
+        self._sync_detection_controls()
         self._sync_profile_combo()
         if self.controller is not None:
-            self.controller.update(self.config, self.profile, self.var_pwd.get())
+            self.controller.update(
+                self.config,
+                self.profile,
+                self.var_pwd.get(),
+                wake=not quiet,
+            )
         if self.tray is not None:
             self.tray.set_auto_login(self.config.auto_login)
+        self._update_bottom_hint()
 
         if self.var_pwd.get() and not self.profile.password_enc:
             log.error("密码未能通过 Windows DPAPI 加密，未安全保存到磁盘；当前会话仍可使用")
-        elif not self.profile.ssid:
-            log.warning("账户「%s」还没有选择 WiFi", self.profile.name)
-        elif not self.profile.username.strip() or not self.var_pwd.get():
-            log.warning("账户「%s」的账号或密码为空，自动登录不会执行", self.profile.name)
-        else:
-            log_success("设置已保存（账户：%s）", self.profile.name)
+        elif not quiet:
+            if not self.profile.ssid:
+                log.warning("账户「%s」还没有选择 WiFi", self.profile.name)
+            elif not self.profile.username.strip() or not self.var_pwd.get():
+                log.warning(
+                    "账户「%s」的账号或密码为空，自动登录不会执行",
+                    self.profile.name,
+                )
+            else:
+                log_success("设置已保存（账户：%s）", self.profile.name)
         return True
 
     def _on_check(self) -> None:
         if self.profile is None or self.controller is None:
             log.warning("请先新建账户")
             return
+        self._cancel_auto_save()
         if not self._save_settings():
             return
         log.info("手动检测已触发（账户：%s）", self.profile.name)
@@ -1032,6 +1675,8 @@ class MainWindow:
             if item and item not in values:
                 values.append(item)
         self.ssid_combo.configure(values=values)
+        if self.profile is not None:
+            self._schedule_wifi_auto_refresh()
 
     def _handle_action(self, action: str) -> None:
         if action == "show":
@@ -1059,11 +1704,26 @@ class MainWindow:
         if self.tray is not None and not self.tray.alive():
             log.error("系统托盘不可用，已切换为普通窗口模式")
             self.tray = None
+            self.var_tray.set(False)
+            self.config.minimize_to_tray = False
+            self._save_config()
+            self._update_bottom_hint()
             if self.root.state() == "withdrawn":
                 self.root.deiconify()
                 self.root.lift()
+            self._show_toast("系统托盘不可用，关闭窗口将退出", error=True)
+
+    def _on_window_unmap(self, event) -> None:
+        if event.widget is self.root:
+            self._hide_tooltips()
+
+    def _hide_tooltips(self) -> None:
+        for tooltip in self._tooltips:
+            tooltip._hide()
 
     def _on_close(self) -> None:
+        self._flush_auto_save()
+        self._hide_tooltips()
         if self.config.minimize_to_tray and self.tray is not None and self.tray.alive():
             self.root.withdraw()
             if not self._hide_notified:
@@ -1078,13 +1738,18 @@ class MainWindow:
     def shutdown(self) -> None:
         if self._closing:
             return
+        self._flush_auto_save()
         self._closing = True
-        if self._poll_job is not None:
-            try:
-                self.root.after_cancel(self._poll_job)
-            except tk.TclError:
-                pass
-            self._poll_job = None
+        for job_name in ("_poll_job", "_autosave_job", "_toast_job", "_wifi_auto_refresh_job"):
+            job = getattr(self, job_name, None)
+            if job is not None:
+                try:
+                    self.root.after_cancel(job)
+                except tk.TclError:
+                    pass
+                setattr(self, job_name, None)
+        for tooltip in self._tooltips:
+            tooltip._hide()
         log.info("正在退出…")
         try:
             if self.controller is not None:

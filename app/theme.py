@@ -23,6 +23,7 @@ MONO = "Consolas"
 
 STATE_COLORS = {
     "init": GRAY,
+    "paused": GRAY,
     "checking": INFO_BLUE,
     "online": SUCCESS,
     "success": SUCCESS,

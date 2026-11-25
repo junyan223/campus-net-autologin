@@ -211,6 +211,63 @@ def list_wifi_networks() -> list[str]:
     return sorted(found.values(), key=str.casefold)
 
 
+def get_wifi_profile_auto_connect(ssid: str) -> bool | None:
+    """读取系统无线配置里的“自动连接”状态；配置不存在时返回 None。"""
+    ssid = (ssid or "").strip()
+    if not ssid:
+        return None
+    try:
+        raw = subprocess.check_output(
+            ["netsh", "wlan", "show", "profile", f"name={ssid}"],
+            creationflags=CREATE_NO_WINDOW,
+            timeout=6,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    text = _decode_netsh(raw)
+    match = re.search(
+        r"^\s*(?:连接模式|Connection mode)\s*[:：]\s*(.+?)\s*$",
+        text,
+        re.MULTILINE | re.IGNORECASE,
+    )
+    if not match:
+        return None
+    value = match.group(1).strip().casefold()
+    if "auto" in value or "自动" in value:
+        return True
+    if "manual" in value or "手动" in value:
+        return False
+    return None
+
+
+def set_wifi_profile_auto_connect(ssid: str, enabled: bool) -> tuple[bool, str]:
+    """修改系统无线配置的自动连接开关。"""
+    ssid = (ssid or "").strip()
+    if not ssid:
+        return False, "WiFi 名称为空"
+    mode = "auto" if enabled else "manual"
+    try:
+        proc = subprocess.run(
+            [
+                "netsh",
+                "wlan",
+                "set",
+                "profileparameter",
+                f"name={ssid}",
+                f"connectionmode={mode}",
+            ],
+            creationflags=CREATE_NO_WINDOW,
+            capture_output=True,
+            timeout=8,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    if proc.returncode == 0:
+        return True, ""
+    detail = _decode_netsh(proc.stdout + proc.stderr).strip()
+    return False, detail or f"netsh 返回 {proc.returncode}"
+
+
 def _is_private_host(host: str) -> bool:
     if not host:
         return False

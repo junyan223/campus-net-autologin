@@ -142,6 +142,7 @@ class Profile:
     username: str = ""
     password_enc: str = ""
     portal_url: str = ""  # 留空 = 使用网络重定向自动探测
+    auto_connect_wifi: bool = True
 
     @classmethod
     def create(cls, name: str) -> "Profile":
@@ -152,6 +153,7 @@ class Profile:
         if not isinstance(raw, dict):
             return None
         name = str(raw.get("name") or "账户").strip() or "账户"
+        auto_connect = raw.get("auto_connect_wifi")
         return cls(
             id=str(raw.get("id") or uuid.uuid4().hex),
             name=name,
@@ -159,6 +161,7 @@ class Profile:
             username=str(raw.get("username") or ""),
             password_enc=str(raw.get("password_enc") or ""),
             portal_url=str(raw.get("portal_url") or "").strip(),
+            auto_connect_wifi=auto_connect if isinstance(auto_connect, bool) else True,
         )
 
     def to_dict(self) -> dict:
@@ -169,6 +172,7 @@ class Profile:
             "username": self.username,
             "password_enc": self.password_enc,
             "portal_url": self.portal_url,
+            "auto_connect_wifi": self.auto_connect_wifi,
         }
 
     def set_password(self, plain: str) -> None:
@@ -181,6 +185,7 @@ class Profile:
         return (
             f"Profile(id={self.id!r}, name={self.name!r}, ssid={self.ssid!r}, "
             f"username={self.username!r}, portal_url={self.portal_url!r}, "
+            f"auto_connect_wifi={self.auto_connect_wifi!r}, "
             f"password={'***' if self.password_enc else ''})"
         )
 
@@ -193,8 +198,10 @@ class AppConfig:
     profiles: list[Profile] = field(default_factory=list)
     active_profile_id: str = ""
     auto_login: bool = True
+    auto_check: bool = True
     check_interval: int = 10
     start_with_windows: bool = False
+    high_priority_start: bool = False
     minimize_to_tray: bool = True
     notify: bool = True
     version: int = 2
@@ -249,7 +256,14 @@ class AppConfig:
         if not isinstance(raw, dict):
             raw = {}
 
-        for name in ("auto_login", "start_with_windows", "minimize_to_tray", "notify"):
+        for name in (
+            "auto_login",
+            "auto_check",
+            "start_with_windows",
+            "high_priority_start",
+            "minimize_to_tray",
+            "notify",
+        ):
             if isinstance(raw.get(name), bool):
                 setattr(cfg, name, raw[name])
         try:
@@ -307,8 +321,10 @@ class AppConfig:
             "active_profile_id": self.active_profile_id,
             "profiles": [p.to_dict() for p in self.profiles],
             "auto_login": self.auto_login,
+            "auto_check": self.auto_check,
             "check_interval": self.check_interval,
             "start_with_windows": self.start_with_windows,
+            "high_priority_start": self.high_priority_start,
             "minimize_to_tray": self.minimize_to_tray,
             "notify": self.notify,
         }

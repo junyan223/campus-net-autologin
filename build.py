@@ -41,6 +41,13 @@ def copy_exe(name: str, target_name: str) -> Path:
     source = ROOT / "dist" / f"{name}.exe"
     target = ROOT / "dist" / target_name
     shutil.copy2(source, target)
+    archive = ROOT / "build" / "dist" / source.name
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        archive.unlink(missing_ok=True)
+        shutil.move(str(source), str(archive))
+    except OSError as exc:
+        print(f"提示：未能归档构建中间文件：{exc}")
     print(f"\n完成：{target}")
     print(f"大小：{target.stat().st_size / 1024 / 1024:.1f} MB")
     return target
@@ -58,7 +65,7 @@ def main() -> int:
     code = build("CampusNetAutoLogin", "main.py")
     if code != 0:
         return code
-    copy_exe("CampusNetAutoLogin", "校园网自动登录v0.1.exe")
+    copy_exe("CampusNetAutoLogin", "校园网自动登录v0.2.exe")
     return 0
 
 
