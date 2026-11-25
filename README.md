@@ -26,7 +26,7 @@ A Windows desktop tool for automatic captive-portal login on campus / public Wi-
 
 ## 使用
 
-1. Windows 10/11；从 Releases 下载 exe（发布后），或从源码运行。
+1. Windows 10/11；从 [Releases](https://github.com/junyan223/campus-net-autologin/releases) 下载共享空白版 exe，或从源码运行。
 2. 打开程序 → 「＋ 新建」→ 填写账户名称、选择/输入 Wi-Fi、登录页（一般留空自动探测）、账号密码 → 保存设置。
 3. 连接该 Wi-Fi 后，程序会在检测间隔内自动登录。
 4. 登录页留空 = 自动探测；自动探测失败时可点「探测」抓取当前认证页，或粘贴完整登录页 URL（含参数）。
@@ -39,10 +39,10 @@ Python 3.12+（Windows）：
 ```powershell
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
-.venv\Scripts\python.exe main.py
+.venv\Scripts\python.exe main_blank.py
 ```
 
-## 构建
+## 构建共享空白版
 
 ```powershell
 .venv\Scripts\python.exe -m pip install -r requirements.txt
@@ -51,8 +51,9 @@ python -m venv .venv
 
 生成：
 
-- `dist/校园网自动登录.exe`：个人版
-- `dist/校园网自动登录 v0.1.exe`：共享空白版（`main_blank.py`，独立配置目录与单实例）
+- `dist/校园网自动登录 v0.1.exe`：共享空白版（`main_blank.py`，独立配置目录与单实例，首次打开无账户）。
+
+> 仓库发布的 exe 只有共享空白版；标准构建仅用于本地开发，不随仓库发布。
 
 ## 安全与隐私
 
@@ -73,9 +74,9 @@ python -m venv .venv
 
 ```text
 app/            # 配置、Wi-Fi/探测、门户解析、控制器、托盘、UI
-main.py         # 个人版入口
+main.py         # 主程序入口（共用）
 main_blank.py   # 共享空白版入口
-build.py        # PyInstaller 构建脚本
+build.py        # PyInstaller 构建脚本（共享空白版）
 assets/app.ico  # 图标
 ```
 
