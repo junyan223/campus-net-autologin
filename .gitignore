@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build artifacts
+build/
+dist/
+*.spec
+*.exe
+
+# Local config / logs / secrets
+config.json
+config.*.json
+*.bak
+*.log
+.env
+.env.*
+token*.txt
+*token*.txt
+
+# Dev artifacts and personal screenshots
+tools/
+*.png
+*.jpg
+*.jpeg
+
+# IDE
+.vscode/
+.idea/
