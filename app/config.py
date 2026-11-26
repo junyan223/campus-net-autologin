@@ -198,6 +198,10 @@ class AppConfig:
     minimize_to_tray: bool = True
     notify: bool = True
     version: int = 2
+    ui_scale_mode: str = "auto"
+    ui_scale: float = 0.0
+    last_update_check_date: str = ""
+    update_source: str = "auto"
 
     # ---- 账户
     def active_profile(self) -> Profile | None:
@@ -257,6 +261,18 @@ class AppConfig:
         except (TypeError, ValueError):
             cfg.check_interval = 10
 
+        mode = raw.get("ui_scale_mode")
+        cfg.ui_scale_mode = mode if mode in ("auto", "manual") else "auto"
+        try:
+            scale = float(raw.get("ui_scale", 0.0))
+        except (TypeError, ValueError):
+            scale = 0.0
+        cfg.ui_scale = round(scale, 2) if 1.0 <= scale <= 2.5 else 0.0
+        last_check = raw.get("last_update_check_date")
+        cfg.last_update_check_date = last_check if isinstance(last_check, str) else ""
+        source = raw.get("update_source")
+        cfg.update_source = source if source in ("auto", "github", "mirror") else "auto"
+
         migrated = False
         profiles_raw = raw.get("profiles")
         if isinstance(profiles_raw, list):
@@ -311,6 +327,10 @@ class AppConfig:
             "start_with_windows": self.start_with_windows,
             "minimize_to_tray": self.minimize_to_tray,
             "notify": self.notify,
+            "ui_scale_mode": self.ui_scale_mode,
+            "ui_scale": self.ui_scale,
+            "last_update_check_date": self.last_update_check_date,
+            "update_source": self.update_source,
         }
 
     def save(self) -> None:

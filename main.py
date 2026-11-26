@@ -89,7 +89,19 @@ def main() -> int:
     parser.add_argument("--exit-after", type=float, default=0, help="N 秒后自动退出（调试用）")
     parser.add_argument("--selftest", action="store_true", help="运行自检后退出")
     parser.add_argument("--parse-url", default=None, help="自检时解析指定认证页")
+    parser.add_argument(
+        "--apply-update",
+        nargs=2,
+        metavar=("TARGET", "PID"),
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
+
+    if args.apply_update:
+        from app.updater import run_apply_update
+
+        return run_apply_update(args.apply_update[0], args.apply_update[1])
 
     if args.selftest:
         return run_selftest(args.parse_url)
@@ -99,6 +111,10 @@ def main() -> int:
 
     events: "queue.Queue[dict]" = queue.Queue()
     setup_logging(APP_DIR, events)
+
+    from app.updater import cleanup_update_cache
+
+    cleanup_update_cache()
 
     cfg = AppConfig.load()
 

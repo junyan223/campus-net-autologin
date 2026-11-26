@@ -9,11 +9,12 @@ import threading
 import time
 import tkinter as tk
 import tkinter.messagebox as messagebox
+import webbrowser
 from tkinter import ttk
 
 from PIL import Image, ImageTk
 
-from . import APP_TITLE
+from . import APP_TITLE, __version__, ui_scale, updater
 from .config import APP_DIR, AppConfig, Profile, is_autostart_enabled, set_autostart
 from .controller import Controller
 from .icons import draw_app_icon, ensure_window_icon
@@ -38,6 +39,7 @@ from .theme import (
     WARN,
 )
 from .tray import TrayIcon
+from .update_ui import UpdateDialog
 
 log = logging.getLogger("campus")
 
@@ -77,6 +79,17 @@ class MainWindow:
         self._probe_busy = False
         self._wifi_busy = False
         self.tray: TrayIcon | None = None
+        self._update_check_busy = False
+        self._update_result: updater.CheckResult | None = None
+        self._update_dialog: UpdateDialog | None = None
+        self._scroll_visible = False
+        self._content_height = 0
+        self._metrics = ui_scale.get_screen_metrics()
+        if config.ui_scale_mode == "manual" and config.ui_scale <= 0:
+            config.ui_scale_mode = "auto"
+        self._ui_scale = ui_scale.resolve_scale(
+            config.ui_scale_mode, config.ui_scale, self._metrics
+        )
 
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
@@ -99,8 +112,12 @@ class MainWindow:
         self.var_tray = tk.BooleanVar(value=config.minimize_to_tray)
         self.var_show_pwd = tk.BooleanVar(value=False)
         self.var_interval = tk.StringVar(value=str(config.check_interval))
+        self.var_ui_scale = tk.StringVar(value=self._scale_choice_label())
 
         self._build_ui()
+        ui_scale.scale_widget_tree(self.root)
+        self.root.update_idletasks()
+        self._sync_scroll()
 
         self.controller: Controller | None = None
         if self.profile is not None:
@@ -120,6 +137,7 @@ class MainWindow:
         self._apply_dark_titlebar()
         self.root.after(400, self._apply_dark_titlebar)
         self.root.after(500, self._refresh_wifi)
+        self.root.after(900, self._maybe_daily_update_check)
         if exit_after > 0:
             self.root.after(int(exit_after * 1000), self.shutdown)
         if self.tray is not None:
@@ -153,52 +171,24 @@ class MainWindow:
     # ------------------------------------------------------------ 外观
 
     def _setup_scaling(self) -> None:
-        try:
-            dpi = self.root.winfo_fpixels("1i")
-            self.root.tk.call("tk", "scaling", dpi / 72.0)
-        except tk.TclError:
-            pass
+        ui_scale.apply_tk_scaling(self.root, self._metrics, self._ui_scale)
+        if abs(self.config.ui_scale - self._ui_scale) > 0.001:
+            self.config.ui_scale = self._ui_scale
+            try:
+                self.config.save()
+            except OSError:
+                pass
 
     def _place_window(self) -> None:
-        class _Rect(ctypes.Structure):
-            _fields_ = [
-                ("left", ctypes.c_long),
-                ("top", ctypes.c_long),
-                ("right", ctypes.c_long),
-                ("bottom", ctypes.c_long),
-            ]
-
-        rect = _Rect()
-        ok = False
-        try:
-            ok = bool(
-                ctypes.windll.user32.SystemParametersInfoW(
-                    0x0030, 0, ctypes.byref(rect), 0
-                )
-            )
-        except Exception:  # noqa: BLE001
-            ok = False
-        if ok:
-            work_w = rect.right - rect.left
-            work_h = rect.bottom - rect.top
-            left, top = rect.left, rect.top
-        else:
-            work_w = self.root.winfo_screenwidth()
-            work_h = self.root.winfo_screenheight() - 48
-            left = top = 0
-        width = 620
-        height = max(660, min(900, work_h - 80))
-        x = left + max(0, (work_w - width) // 2)
-        y = top + max(0, (work_h - height - 39) // 2)
-        self.root.geometry(f"{width}x{height}+{x}+{y}")
-        self.root.minsize(560, min(720, height))
+        ui_scale.place_window(self.root, self._metrics, self._ui_scale)
 
     def _setup_icon(self) -> None:
         try:
             self.root.iconbitmap(str(ensure_window_icon(APP_DIR)))
         except (OSError, tk.TclError):
             pass
-        image = draw_app_icon(64).resize((28, 28), Image.LANCZOS)
+        icon_size = ui_scale.px(28)
+        image = draw_app_icon(64).resize((icon_size, icon_size), Image.LANCZOS)
         self._header_photo = ImageTk.PhotoImage(image)
 
     def _setup_ttk_styles(self) -> None:
@@ -216,7 +206,7 @@ class MainWindow:
             bordercolor=BORDER,
             lightcolor=BORDER,
             darkcolor=BORDER,
-            padding=4,
+            padding=ui_scale.px(4),
             selectbackground=INPUT,
             selectforeground=TEXT,
             font=(FONT, 9),
@@ -228,6 +218,22 @@ class MainWindow:
             bordercolor=[("focus", ACCENT)],
             arrowcolor=[("active", TEXT)],
         )
+        style.configure(
+            "Dark.Vertical.TScrollbar",
+            background=CARD,
+            troughcolor=INPUT,
+            bordercolor=BORDER,
+            arrowcolor=MUTED,
+            darkcolor=CARD,
+            lightcolor=CARD,
+            arrowsize=ui_scale.px(12),
+        )
+        style.map(
+            "Dark.Vertical.TScrollbar",
+            background=[("active", MUTED)],
+            arrowcolor=[("active", TEXT)],
+        )
+
         self.root.option_add("*TCombobox*Listbox.background", INPUT)
         self.root.option_add("*TCombobox*Listbox.foreground", TEXT)
         self.root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
@@ -354,7 +360,27 @@ class MainWindow:
         )
 
     def _build_ui(self) -> None:
-        outer = tk.Frame(self.root, bg=BG)
+        self._viewport = tk.Canvas(self.root, bg=BG, highlightthickness=0, bd=0)
+        self._viewport.pack(side="left", fill="both", expand=True)
+        self._vscroll = ttk.Scrollbar(
+            self.root,
+            orient="vertical",
+            command=self._viewport.yview,
+            style="Dark.Vertical.TScrollbar",
+        )
+        self._viewport.configure(
+            yscrollcommand=self._vscroll.set,
+            yscrollincrement=ui_scale.px(20),
+        )
+        self._content = tk.Frame(self._viewport, bg=BG)
+        self._content_window = self._viewport.create_window(
+            (0, 0), window=self._content, anchor="nw"
+        )
+        self._viewport.bind("<Configure>", self._on_viewport_configure)
+        self._content.bind("<Configure>", self._on_content_configure)
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+
+        outer = tk.Frame(self._content, bg=BG)
         outer.pack(fill="both", expand=True, padx=14, pady=10)
         outer.grid_columnconfigure(0, weight=1)
         outer.grid_rowconfigure(5, weight=1)
@@ -365,14 +391,33 @@ class MainWindow:
         tk.Label(header, image=self._header_photo, bg=BG).pack(side="left")
         title_box = tk.Frame(header, bg=BG)
         title_box.pack(side="left", padx=(10, 0))
+        title_row = tk.Frame(title_box, bg=BG)
+        title_row.pack(anchor="w")
         tk.Label(
-            title_box,
+            title_row,
             text=APP_TITLE,
             bg=BG,
             fg=TEXT,
             font=(FONT, 14, "bold"),
             anchor="w",
-        ).pack(anchor="w")
+        ).pack(side="left", anchor="w")
+        self.update_btn = tk.Button(
+            title_row,
+            text="检查更新",
+            command=self._on_update_click,
+            bg=BG,
+            fg=MUTED,
+            activebackground=CARD,
+            activeforeground=TEXT,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            padx=6,
+            pady=1,
+            font=(FONT, 8),
+            cursor="hand2",
+        )
+        self.update_btn.pack(side="left", padx=(8, 0), pady=(1, 0))
         tk.Label(
             title_box,
             text="多网络账户 · 自动认证助手",
@@ -381,15 +426,39 @@ class MainWindow:
             font=(FONT, 8),
             anchor="w",
         ).pack(anchor="w")
+        self.github_btn = tk.Label(
+            header,
+            text="GitHub ↗",
+            bg=BG,
+            fg=MUTED,
+            font=(FONT, 8),
+            cursor="hand2",
+        )
+        self.github_btn.pack(side="right", anchor="ne", pady=(2, 0))
+        self.github_btn.bind("<Button-1>", lambda _event: self._open_github())
+        self.github_btn.bind(
+            "<Enter>", lambda _event: self.github_btn.configure(fg=TEXT)
+        )
+        self.github_btn.bind(
+            "<Leave>", lambda _event: self.github_btn.configure(fg=MUTED)
+        )
 
         # 状态卡片
         status_card = Card(outer)
         status_card.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        dot_size = ui_scale.px(16)
+        dot_pad = ui_scale.px(2)
         self.status_dot = tk.Canvas(
-            status_card.inner, width=16, height=16, bg=CARD, highlightthickness=0
+            status_card.inner,
+            width=dot_size,
+            height=dot_size,
+            bg=CARD,
+            highlightthickness=0,
         )
         self.status_dot.grid(row=0, column=0, sticky="w", padx=(0, 9))
-        self._dot = self.status_dot.create_oval(2, 2, 14, 14, fill=GRAY, outline="")
+        self._dot = self.status_dot.create_oval(
+            dot_pad, dot_pad, dot_size - dot_pad, dot_size - dot_pad, fill=GRAY, outline=""
+        )
         self.status_title = tk.Label(
             status_card.inner,
             text="正在启动…",
@@ -569,6 +638,29 @@ class MainWindow:
             font=(FONT, 8),
         ).grid(row=2, column=3, columnspan=2, sticky="w", pady=(4, 0), padx=(8, 0))
 
+        tk.Label(body, text="界面缩放", bg=CARD, fg=MUTED, font=(FONT, 9)).grid(
+            row=3, column=0, sticky="w", pady=(4, 0)
+        )
+        self.scale_combo = self._combo(
+            body,
+            self.var_ui_scale,
+            [item[0] for item in ui_scale.manual_options()],
+            8,
+            readonly=True,
+        )
+        self.scale_combo.grid(row=3, column=1, sticky="w", pady=(4, 0), padx=(6, 4))
+        self.scale_combo.bind("<<ComboboxSelected>>", self._on_ui_scale_changed)
+        self.scale_hint = tk.Label(
+            body,
+            text=self._scale_hint_text(),
+            bg=CARD,
+            fg=HINT,
+            font=(FONT, 8),
+        )
+        self.scale_hint.grid(
+            row=3, column=3, columnspan=2, sticky="w", pady=(4, 0), padx=(8, 0)
+        )
+
         # 按钮
         buttons = tk.Frame(outer, bg=BG)
         buttons.grid(row=4, column=0, sticky="ew", pady=(0, 8))
@@ -607,8 +699,12 @@ class MainWindow:
         clear.bind("<Enter>", lambda _event: clear.configure(fg=TEXT))
         clear.bind("<Leave>", lambda _event: clear.configure(fg=HINT))
 
+        log_wrap = tk.Frame(body, bg=CARD)
+        log_wrap.grid(row=1, column=0, sticky="nsew")
+        log_wrap.grid_rowconfigure(0, weight=1)
+        log_wrap.grid_columnconfigure(0, weight=1)
         self.log_text = tk.Text(
-            body,
+            log_wrap,
             height=7,
             wrap="word",
             bg="#101216",
@@ -622,7 +718,15 @@ class MainWindow:
             font=(MONO, 9),
             state="disabled",
         )
-        self.log_text.grid(row=1, column=0, sticky="nsew")
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        self.log_scroll = ttk.Scrollbar(
+            log_wrap,
+            orient="vertical",
+            command=self.log_text.yview,
+            style="Dark.Vertical.TScrollbar",
+        )
+        self.log_scroll.grid(row=0, column=1, sticky="ns")
+        self.log_text.configure(yscrollcommand=self.log_scroll.set)
         self.log_text.tag_configure("time", foreground=HINT)
         self.log_text.tag_configure("INFO", foreground=MUTED)
         self.log_text.tag_configure("SUCCESS", foreground=SUCCESS)
@@ -636,7 +740,213 @@ class MainWindow:
             bg=BG,
             fg=HINT,
             font=(FONT, 8),
+            wraplength=580,
         ).grid(row=6, column=0, sticky="w", pady=(6, 0))
+
+    # ------------------------------------------------------------ 布局与缩放
+
+    def _scale_choice_label(self) -> str:
+        if self.config.ui_scale_mode == "manual" and 1.0 <= self.config.ui_scale <= 2.5:
+            return f"{int(round(self.config.ui_scale * 100))}%"
+        return "自动"
+
+    def _scale_hint_text(self) -> str:
+        return f"当前 {int(round(self._ui_scale * 100))}% · 重启后生效"
+
+    def _save_config(self) -> bool:
+        try:
+            self.config.save()
+            return True
+        except OSError as exc:
+            log.error("保存配置失败：%s", exc)
+            return False
+
+    def _on_ui_scale_changed(self, _event=None) -> None:
+        label = self.var_ui_scale.get()
+        selected = next(
+            (item for item in ui_scale.manual_options() if item[0] == label), None
+        )
+        if selected is None:
+            self.var_ui_scale.set(self._scale_choice_label())
+            return
+        _, mode, value = selected
+        self.config.ui_scale_mode = mode
+        self.config.ui_scale = (
+            value if mode == "manual" else round(self._ui_scale, 2)
+        )
+        if not self._save_config():
+            self.var_ui_scale.set(self._scale_choice_label())
+            return
+        self.scale_hint.configure(text=self._scale_hint_text())
+        log.info("界面缩放已设置为 %s，重启后生效", label)
+
+    def _on_viewport_configure(self, event) -> None:
+        try:
+            self._viewport.itemconfigure(
+                self._content_window, width=max(1, int(event.width))
+            )
+            request_height = self._content.winfo_reqheight()
+            target = max(request_height, int(event.height))
+            if target != self._content_height:
+                self._content_height = target
+                self._viewport.itemconfigure(self._content_window, height=target)
+        except tk.TclError:
+            pass
+        self._sync_scroll()
+
+    def _on_content_configure(self, _event) -> None:
+        try:
+            request_height = self._content.winfo_reqheight()
+            viewport_height = max(1, self._viewport.winfo_height())
+            target = max(request_height, viewport_height)
+            if target != self._content_height:
+                self._content_height = target
+                self._viewport.itemconfigure(self._content_window, height=target)
+        except tk.TclError:
+            pass
+        self._sync_scroll()
+
+    def _sync_scroll(self) -> None:
+        if self._closing:
+            return
+        try:
+            bbox = self._viewport.bbox("all")
+            if not bbox:
+                return
+            self._viewport.configure(scrollregion=bbox)
+            need = (bbox[3] - bbox[1]) > self._viewport.winfo_height() + 1
+            if need and not self._scroll_visible:
+                self._vscroll.pack(side="right", fill="y")
+                self._scroll_visible = True
+            elif not need and self._scroll_visible:
+                self._vscroll.pack_forget()
+                self._scroll_visible = False
+                self._viewport.yview_moveto(0)
+        except tk.TclError:
+            pass
+
+    def _on_mousewheel(self, event) -> None:
+        if not self._scroll_visible:
+            return
+        try:
+            if event.widget.winfo_toplevel() is not self.root:
+                return
+        except tk.TclError:
+            return
+        if isinstance(
+            event.widget,
+            (
+                tk.Text,
+                tk.Listbox,
+                tk.Spinbox,
+                ttk.Scrollbar,
+                ttk.Combobox,
+            ),
+        ):
+            return
+        delta = int(-event.delta / 120) if event.delta else 0
+        if not delta:
+            return
+        try:
+            self._viewport.yview_scroll(delta * 3, "units")
+        except tk.TclError:
+            pass
+
+    # ------------------------------------------------------------ 更新
+
+    def _open_github(self) -> None:
+        webbrowser.open(f"https://github.com/{updater.GITHUB_REPO}")
+
+    def _on_update_click(self) -> None:
+        if self._update_dialog is not None:
+            try:
+                if self._update_dialog.winfo_exists():
+                    self._update_dialog.lift()
+                    self._update_dialog.focus_force()
+                    return
+            except tk.TclError:
+                pass
+            self._update_dialog = None
+        self._update_dialog = UpdateDialog(self)
+
+    def clear_update_dialog(self, dialog: UpdateDialog) -> None:
+        if self._update_dialog is dialog:
+            self._update_dialog = None
+
+    def _maybe_daily_update_check(self) -> None:
+        if self._closing or self._update_check_busy:
+            return
+        if self.config.last_update_check_date == updater.today_str():
+            return
+        self.start_update_check()
+
+    def start_update_check(self, dialog: UpdateDialog | None = None) -> None:
+        if dialog is not None:
+            self._update_dialog = dialog
+        if self._update_check_busy:
+            return
+        self._update_check_busy = True
+        self._set_update_button("checking")
+
+        def worker() -> None:
+            result = updater.check_for_update(__version__)
+            self.events.put({"type": "update_check", "result": result})
+
+        threading.Thread(target=worker, name="update-check", daemon=True).start()
+
+    def _handle_update_check(self, result: object) -> None:
+        self._update_check_busy = False
+        if not isinstance(result, updater.CheckResult):
+            result = updater.CheckResult(
+                current_version=__version__, error="检查更新失败"
+            )
+        self._update_result = result
+        if not result.error:
+            self.config.last_update_check_date = updater.today_str()
+            self._save_config()
+
+        if result.error:
+            self._set_update_button("error")
+            log.warning("检查更新失败：%s", result.error)
+        elif result.has_update and result.latest is not None:
+            self._set_update_button("available", result.latest.tag)
+            log.info("发现新版本：%s", result.latest.tag)
+        else:
+            self._set_update_button("latest")
+            log.info("检查更新完成：当前已是最新版本")
+
+        dialog = self._update_dialog
+        if dialog is not None:
+            try:
+                if dialog.winfo_exists():
+                    dialog.show_result(result)
+                else:
+                    self._update_dialog = None
+            except tk.TclError:
+                self._update_dialog = None
+
+    def _set_update_button(self, state: str, tag: str = "") -> None:
+        if state == "checking":
+            text, color, background = "检查中…", HINT, BG
+        elif state == "available":
+            text = f"发现新版本 {tag}" if tag else "发现新版本"
+            color, background = ACCENT, "#16243a"
+        elif state == "latest":
+            text, color, background = "已是最新", MUTED, BG
+        elif state == "error":
+            text, color, background = "检查失败，重试", WARN, BG
+        else:
+            text, color, background = "检查更新", MUTED, BG
+        try:
+            self.update_btn.configure(
+                text=text,
+                fg=color,
+                bg=background,
+                activebackground=CARD,
+                font=(FONT, 8, "bold" if state == "available" else "normal"),
+            )
+        except tk.TclError:
+            pass
 
     # ------------------------------------------------------------ 事件
 
@@ -673,6 +983,8 @@ class MainWindow:
             self._handle_portal_probe(event)
         elif kind == "wifi_list":
             self._handle_wifi_list(event)
+        elif kind == "update_check":
+            self._handle_update_check(event.get("result"))
         elif kind == "action":
             self._handle_action(event.get("action", ""))
 
