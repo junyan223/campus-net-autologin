@@ -95,7 +95,19 @@ def main() -> int:
         default=None,
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--apply-update",
+        nargs=2,
+        metavar=("TARGET", "PID"),
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
+
+    if args.apply_update:
+        from app.updater import run_apply_update
+
+        return run_apply_update(args.apply_update[0], args.apply_update[1])
 
     if args.high_priority_task:
         APP_DIR.mkdir(parents=True, exist_ok=True)
@@ -115,6 +127,10 @@ def main() -> int:
 
     events: "queue.Queue[dict]" = queue.Queue()
     setup_logging(APP_DIR, events)
+
+    from app.updater import cleanup_update_cache
+
+    cleanup_update_cache()
 
     cfg = AppConfig.load()
 
